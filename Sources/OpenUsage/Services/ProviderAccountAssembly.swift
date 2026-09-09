@@ -265,37 +265,56 @@ struct ProviderAccountAssembly {
         cliIdentity: String?,
         listDirectories: @Sendable (URL) -> [String]
     ) -> [DesktopOrganization] {
-        guard let user = desktop.lastKnownAccountUUID(), desktop.hasCredentialMaterial() else { return [] }
-        let active = desktop.load(allowInteraction: false, expectedAccountUUID: user)
-        let activeOrganization = active.organization
-
         let root = desktop.homeDirectory().appendingPathComponent("Library/Application Support/Claude")
-        let memberships = Set(["claude-code-sessions", "local-agent-mode-sessions"].flatMap { directory in
-            listDirectories(root.appendingPathComponent(directory).appendingPathComponent(user))
-                .compactMap { UUID(uuidString: $0)?.uuidString.lowercased() }
-        })
-        var organizations = memberships
-        if let activeOrganization { organizations.insert(activeOrganization) }
+
+        // Scan two directory levels: <sessionDir>/<accountUUID>/<orgUUID>.
+        // Build orgUUID → accountUUID so every account's orgs are discovered, not just
+        // the one in lastKnownAccountUUID.
+        var orgToAccount: [String: String] = [:]
+        for directory in ["claude-code-sessions", "local-agent-mode-sessions"] {
+            let sessionDir = root.appendingPathComponent(directory)
+            for accountEntry in listDirectories(sessionDir) {
+                guard let accountUUID = UUID(uuidString: accountEntry)?.uuidString.lowercased() else { continue }
+                for orgEntry in listDirectories(sessionDir.appendingPathComponent(accountEntry)) {
+                    guard let orgUUID = UUID(uuidString: orgEntry)?.uuidString.lowercased() else { continue }
+                    if orgToAccount[orgUUID] == nil { orgToAccount[orgUUID] = accountUUID }
+                }
+            }
+        }
+        let sessionOrgs = Set(orgToAccount.keys)
+        var organizations = sessionOrgs
+
+        let user = desktop.lastKnownAccountUUID()
+
         if let text = try? desktop.files.readTextIfPresent(root.appendingPathComponent("config.json").path),
            let rootObject = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any]
         {
-            organizations.formUnion(rootObject.keys.compactMap {
-                $0.split(separator: ":").last.flatMap { UUID(uuidString: String($0))?.uuidString.lowercased() }
-            })
+            for org in rootObject.keys.compactMap({ $0.split(separator: ":").last.flatMap { UUID(uuidString: String($0))?.uuidString.lowercased() } }) {
+                organizations.insert(org)
+                if orgToAccount[org] == nil { orgToAccount[org] = user }
+            }
         }
         if let text = try? desktop.files.readTextIfPresent(
             root.appendingPathComponent("plan-usage-history.json").path
         ), let history = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any],
            let samples = history["samples"] as? [[String: Any]]
         {
-            organizations.formUnion(samples.compactMap {
-                ($0["org"] as? String).flatMap { UUID(uuidString: $0)?.uuidString.lowercased() }
-            })
+            for org in samples.compactMap({ ($0["org"] as? String).flatMap { UUID(uuidString: $0)?.uuidString.lowercased() } }) {
+                organizations.insert(org)
+                if orgToAccount[org] == nil { orgToAccount[org] = user }
+            }
         }
+
+        let active: ClaudeDesktopCredentialResult? = user.flatMap { u in
+            desktop.hasCredentialMaterial() ? desktop.load(allowInteraction: false, expectedAccountUUID: u) : nil
+        }
+        let activeOrganization = active?.organization
+        if let activeOrganization { organizations.insert(activeOrganization) }
+
         let cliOrganization = cliIdentity.flatMap { identity -> String? in
             let parts = identity.split(separator: "|")
             guard parts.count == 2,
-                  String(parts[0]).caseInsensitiveCompare(user) == .orderedSame
+                  user.map({ String(parts[0]).caseInsensitiveCompare($0) == .orderedSame }) == true
             else { return nil }
             return String(parts[1]).lowercased()
         }
@@ -303,17 +322,27 @@ struct ProviderAccountAssembly {
         return organizations.sorted { lhs, rhs in
             lhs == activeOrganization ? true : rhs == activeOrganization ? false : lhs < rhs
         }.compactMap { organization in
-            guard memberships.contains(organization)
+            guard sessionOrgs.contains(organization)
                 || organization == activeOrganization || organization == cliOrganization
             else { return nil }
-            let result = organization == activeOrganization ? active : desktop.load(
-                allowInteraction: false, organization: organization, expectedAccountUUID: user
-            )
+
+            guard desktop.hasCredentialMaterial() else { return nil }
+
+            let result: ClaudeDesktopCredentialResult
+            if organization == activeOrganization, let active {
+                result = active
+            } else {
+                // Load without expectedAccountUUID so Desktop's current login doesn't
+                // block orgs belonging to a different account UUID in the session dirs.
+                result = desktop.load(allowInteraction: false, organization: organization)
+            }
             guard result.status == .available || result.status == .permissionRequired else { return nil }
+
+            let accountUUID = orgToAccount[organization] ?? user ?? organization
             let plan = result.oauth?.subscriptionType?.lowercased()
             let label = plan.map { ["max", "pro", "free"].contains($0) } == true ? "Personal"
                 : plan?.capitalized ?? "Organization \(organization.prefix(8))"
-            return DesktopOrganization(id: organization, identityKey: "\(user)|\(organization)", label: label)
+            return DesktopOrganization(id: organization, identityKey: "\(accountUUID)|\(organization)", label: label)
         }
     }
 }
